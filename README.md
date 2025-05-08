@@ -1,2 +1,1 @@
-# projekat1
-videcu posle
+# mojalista-docker
