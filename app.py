@@ -2,7 +2,7 @@ import re
 from urllib.parse import urlparse
 
 import streamlit as st
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 
 st.set_page_config(page_title="Provera izvora", page_icon="🔎", layout="wide")
 
@@ -12,24 +12,21 @@ PRIMARY_DOMAINS = {
     "odihr.osce.org", "europa.eu", "ec.europa.eu", "un.org", "ohchr.org",
 }
 
-WIRE_AND_PUBLIC_SERVICE = {
+STRONG_MEDIA = {
     "reuters.com", "apnews.com", "afp.com", "bbc.com", "bbc.co.uk",
-    "dw.com", "rferl.org", "slobodnaevropa.org",
-}
-
-SERBIAN_NEWS = {
-    "n1info.rs", "rts.rs", "insajder.net", "vreme.com", "nova.rs",
-    "danas.rs", "021.rs", "beta.rs", "fonet.rs",
+    "dw.com", "rferl.org", "slobodnaevropa.org", "n1info.rs", "rts.rs",
+    "insajder.net", "vreme.com", "nova.rs", "danas.rs", "021.rs",
+    "beta.rs", "fonet.rs",
 }
 
 LOW_SIGNAL_HINTS = (
-    "opinion", "kolumna", "blog", "forum", "reddit", "facebook",
-    "instagram", "tiktok", "youtube", "x.com", "twitter",
+    "amazon.", "bestbuy.", "costco.", "rule34", "pinterest.", "reddit.",
+    "facebook.", "instagram.", "tiktok.", "youtube.", "x.com", "twitter.",
 )
 
 STOPWORDS = {
-    "da", "li", "je", "su", "se", "u", "na", "i", "a", "za", "od",
-    "do", "po", "sa", "ko", "sta", "šta", "kako", "zasto", "zašto",
+    "da", "li", "je", "su", "se", "u", "na", "i", "a", "za", "od", "do",
+    "po", "sa", "ko", "sta", "šta", "kako", "zasto", "zašto", "ovaj", "ova",
     "the", "is", "are", "was", "were", "of", "to", "in", "on", "and",
 }
 
@@ -42,174 +39,150 @@ def domain_matches(host: str, domains: set[str]) -> bool:
     return any(host == d or host.endswith("." + d) for d in domains)
 
 
-def source_type(url: str) -> tuple[str, int]:
-    host = host_of(url)
-    path = urlparse(url).path.lower()
-    if domain_matches(host, PRIMARY_DOMAINS):
-        return "Primarni / zvanični izvor", 40
-    if domain_matches(host, WIRE_AND_PUBLIC_SERVICE):
-        return "Međunarodni nezavisni medij", 30
-    if domain_matches(host, SERBIAN_NEWS):
-        return "Domaći informativni medij", 20
-    if any(h in host or h in path for h in LOW_SIGNAL_HINTS):
-        return "Komentar / društvena mreža / niži signal", 0
-    return "Ostali izvor", 10
-
-
 def tokenize(text: str) -> set[str]:
     words = re.findall(r"[A-Za-zČĆŽŠĐčćžšđ0-9]{3,}", text.lower())
     return {w for w in words if w not in STOPWORDS}
 
 
-def relevance_score(query: str, title: str, snippet: str) -> int:
+def source_type(url: str) -> tuple[str, int]:
+    host = host_of(url)
+    if any(x in host for x in LOW_SIGNAL_HINTS):
+        return "Nerelevantan / nizak signal", -100
+    if domain_matches(host, PRIMARY_DOMAINS):
+        return "Primarni / zvanični izvor", 30
+    if domain_matches(host, STRONG_MEDIA):
+        return "Informativni izvor", 20
+    return "Ostali izvor", 5
+
+
+def relevance(query: str, title: str, snippet: str) -> tuple[int, int]:
     q = tokenize(query)
+    text = tokenize(f"{title} {snippet}")
+    hits = len(q & text)
     if not q:
-        return 0
-    title_tokens = tokenize(title)
-    snippet_tokens = tokenize(snippet)
-    title_hits = len(q & title_tokens)
-    snippet_hits = len(q & snippet_tokens)
-    return min(40, title_hits * 8 + snippet_hits * 3)
+        return 0, 0
+    score = round((hits / len(q)) * 60)
+    return score, hits
 
 
-def build_queries(query: str) -> list[str]:
+def build_queries(query: str) -> list[tuple[str, str]]:
+    # Ne dodajemo strane ključne reči tipa "Reuters AP BBC" u glavni upit,
+    # jer su prethodno kvarile rezultate za kratke upite na srpskom.
     return [
-        query,
-        f'{query} official document report statement',
-        f'{query} Reuters AP BBC RFE',
+        ("web", query),
+        ("news", query),
+        ("web", f'{query} Srbija'),
+        ("news", f'{query} Srbija'),
     ]
 
 
-def search_web(query: str, max_results: int = 12):
+def run_search(mode: str, query: str, limit: int):
+    ddgs = DDGS(timeout=8)
+    if mode == "news":
+        return ddgs.news(query, max_results=limit, safesearch="moderate")
+    return ddgs.text(query, max_results=limit, safesearch="moderate")
+
+
+def search_web(query: str, max_results: int = 10):
     collected = {}
-    per_query = max(6, min(12, max_results))
-    with DDGS() as ddgs:
-        for q in build_queries(query):
-            try:
-                rows = ddgs.text(q, max_results=per_query)
-            except Exception:
-                rows = []
-            for r in rows:
-                url = r.get("href") or r.get("url")
-                if not url:
-                    continue
-                title = r.get("title", "") or ""
-                snippet = r.get("body", "") or ""
-                host = host_of(url)
-                kind, authority = source_type(url)
-                relevance = relevance_score(query, title, snippet)
-                rank = authority + relevance
-                row = {
-                    "title": title,
-                    "url": url,
-                    "snippet": snippet,
-                    "host": host,
-                    "kind": kind,
-                    "authority": authority,
-                    "relevance": relevance,
-                    "rank": rank,
-                }
-                old = collected.get(url)
-                if old is None or row["rank"] > old["rank"]:
-                    collected[url] = row
+    qtokens = tokenize(query)
+    min_hits = 1 if len(qtokens) <= 2 else 2
+
+    for mode, q in build_queries(query):
+        try:
+            rows = run_search(mode, q, max(8, max_results))
+        except Exception:
+            continue
+
+        for r in rows or []:
+            url = r.get("href") or r.get("url")
+            if not url:
+                continue
+            title = (r.get("title") or "").strip()
+            snippet = (r.get("body") or r.get("excerpt") or "").strip()
+            host = host_of(url)
+            kind, authority = source_type(url)
+            rel, hits = relevance(query, title, snippet)
+
+            # Ključna zaštita od rezultata kao Amazon/HP/Rule34: rezultat mora
+            # stvarno da sadrži reči iz korisnikovog pitanja.
+            if hits < min_hits:
+                continue
+            if authority < 0:
+                continue
+
+            rank = rel + authority
+            row = {
+                "title": title or host,
+                "url": url,
+                "snippet": snippet,
+                "host": host,
+                "kind": kind,
+                "relevance": rel,
+                "rank": rank,
+            }
+            old = collected.get(url)
+            if old is None or rank > old["rank"]:
+                collected[url] = row
 
     results = sorted(collected.values(), key=lambda x: (-x["rank"], -x["relevance"], x["host"]))
+
     final = []
-    host_counts = {}
+    per_host = {}
     for r in results:
-        host_counts[r["host"]] = host_counts.get(r["host"], 0)
-        if host_counts[r["host"]] >= 2:
+        if per_host.get(r["host"], 0) >= 2:
             continue
         final.append(r)
-        host_counts[r["host"]] += 1
+        per_host[r["host"]] = per_host.get(r["host"], 0) + 1
         if len(final) >= max_results:
             break
     return final
 
 
-def coverage_score(results):
+def coverage(results):
     if not results:
-        return "Nema dovoljno izvora", 0
-    independent_hosts = len({r["host"] for r in results})
-    primary = sum(1 for r in results if r["kind"] == "Primarni / zvanični izvor")
-    strong_media = sum(1 for r in results if r["kind"] == "Međunarodni nezavisni medij")
-    relevant = sum(1 for r in results if r["relevance"] >= 12)
-    score = min(100, independent_hosts * 5 + primary * 15 + strong_media * 10 + relevant * 4)
-    if score >= 75:
-        label = "Jaka pokrivenost — više nezavisnih i/ili primarnih izvora"
-    elif score >= 50:
-        label = "Dobra pokrivenost — zaključak proveri u primarnim izvorima"
-    elif score >= 25:
-        label = "Ograničena pokrivenost — potrebna dodatna provera"
-    else:
-        label = "Slaba pokrivenost — ne izvodi čvrst zaključak"
-    return label, score
+        return "Nema dovoljno relevantnih izvora", 0
+    hosts = len({r["host"] for r in results})
+    strong = sum(1 for r in results if r["kind"] != "Ostali izvor")
+    highly_relevant = sum(1 for r in results if r["relevance"] >= 40)
+    score = min(100, hosts * 6 + strong * 8 + highly_relevant * 5)
+    if score >= 70:
+        return "Dobra pokrivenost", score
+    if score >= 40:
+        return "Srednja pokrivenost", score
+    return "Ograničena pokrivenost", score
 
 
 st.title("🔎 Provera izvora")
-st.caption("Pretraga koja rangira relevantnost, primarne izvore i nezavisno potvrđivanje.")
+st.caption("Alat prvo odbacuje nerelevantne rezultate, zatim rangira izvore po relevantnosti i tipu izvora.")
 
 query = st.text_area(
     "Unesi tvrdnju, temu ili pitanje",
-    placeholder="Primer: Da li je 15. marta 2025. korišćeno zvučno oružje protiv demonstranata?",
+    placeholder="Primer: studenti su u Beogradu",
 )
-
-col1, col2 = st.columns([1, 3])
-with col1:
-    count = st.slider("Broj rezultata", 6, 15, 10)
-with col2:
-    st.info("Rangiranje nije ocena istine. Više rangira relevantne, primarne i nezavisne izvore, a spušta komentare i društvene mreže.")
+count = st.slider("Broj rezultata", 5, 15, 10)
 
 if st.button("Proveri", type="primary", use_container_width=True):
     if not query.strip():
         st.warning("Unesi pitanje ili tvrdnju.")
     else:
-        with st.spinner("Tražim i rangiram više vrsta izvora..."):
-            results = search_web(query, count)
-            label, score = coverage_score(results)
+        with st.spinner("Tražim relevantne izvore..."):
+            results = search_web(query.strip(), count)
+            label, score = coverage(results)
 
-        st.subheader("Procena kvaliteta pokrivenosti")
+        st.subheader("Procena pokrivenosti")
         st.progress(score / 100)
         st.write(f"**{label}** — {score}/100")
 
-        primary_results = [r for r in results if r["kind"] == "Primarni / zvanični izvor"]
-        media_results = [r for r in results if r["kind"] in {"Međunarodni nezavisni medij", "Domaći informativni medij"}]
-        other_results = [r for r in results if r not in primary_results and r not in media_results]
-
-        if primary_results:
-            st.subheader("1. Primarni i zvanični izvori")
-            for r in primary_results:
-                st.markdown(f"**[{r['title'] or r['host']}]({r['url']})**")
-                if r["snippet"]:
-                    st.write(r["snippet"])
-                st.caption(f"{r['host']} · relevantnost {r['relevance']}/40 · rang {r['rank']}")
-
-        if media_results:
-            st.subheader("2. Nezavisno izveštavanje")
-            for r in media_results:
-                with st.expander(f"{r['title'] or r['host']} — {r['host']}"):
-                    st.write(r["snippet"] or "Nema dostupnog sažetka.")
-                    st.markdown(f"[Otvori izvor]({r['url']})")
-                    st.caption(f"{r['kind']} · relevantnost {r['relevance']}/40 · rang {r['rank']}")
-
-        if other_results:
-            st.subheader("3. Ostali rezultati")
-            for r in other_results:
-                with st.expander(f"{r['title'] or r['host']} — {r['host']}"):
-                    st.write(r["snippet"] or "Nema dostupnog sažetka.")
-                    st.markdown(f"[Otvori izvor]({r['url']})")
-                    st.caption(f"{r['kind']} · relevantnost {r['relevance']}/40 · rang {r['rank']}")
-
         if not results:
-            st.warning("Nisam našao dovoljno rezultata. Probaj kraću ili precizniju formulaciju tvrdnje.")
-
-        st.subheader("Kako čitati rezultat")
-        st.markdown("""
-- **Primarni izvor** ima prednost za pitanje šta je institucija zaista odlučila, objavila ili rekla.
-- Za sporne događaje traži **najmanje dva međusobno nezavisna izvora**.
-- Visoko rangiran medij nije automatski dokaz da je tvrdnja tačna; proveri na čemu zasniva zaključak.
-- Ako primarni izvori i nezavisni mediji daju različitu sliku, tretiraj tvrdnju kao **spornu**, ne kao potvrđenu.
-        """)
+            st.warning("Pretraga nije našla dovoljno relevantnih rezultata. To ne znači da je tvrdnja netačna — samo da pretraga nije našla dovoljno dobrih izvora.")
+        else:
+            for i, r in enumerate(results, 1):
+                with st.expander(f"{i}. {r['title']} — {r['host']}", expanded=i <= 3):
+                    if r["snippet"]:
+                        st.write(r["snippet"])
+                    st.markdown(f"[Otvori izvor]({r['url']})")
+                    st.caption(f"{r['kind']} · relevantnost {r['relevance']}/60")
 
 st.divider()
-st.caption("Neutralni alat: rangira kvalitet i relevantnost izvora, ali ne proglašava političke tvrdnje istinitim bez dokaza.")
+st.caption("Rezultat pretrage nije automatska presuda da je tvrdnja tačna ili netačna.")
