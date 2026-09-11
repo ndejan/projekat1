@@ -16,7 +16,7 @@ STRONG_MEDIA = {
     "reuters.com", "apnews.com", "afp.com", "bbc.com", "bbc.co.uk",
     "dw.com", "rferl.org", "slobodnaevropa.org", "n1info.rs", "rts.rs",
     "insajder.net", "vreme.com", "nova.rs", "danas.rs", "021.rs",
-    "beta.rs", "fonet.rs",
+    "beta.rs", "fonet.rs", "bg.ac.rs",
 }
 
 LOW_SIGNAL_HINTS = (
@@ -65,32 +65,38 @@ def relevance(query: str, title: str, snippet: str) -> tuple[int, int]:
     return score, hits
 
 
-def build_queries(query: str) -> list[tuple[str, str]]:
-    return [
-        ("web", query),
-        ("news", query),
-        ("web", f'{query} Srbija'),
-        ("news", f'{query} Srbija'),
-    ]
+def build_queries(query: str) -> list[str]:
+    return [query, f"{query} Srbija", f'"{query}"']
 
 
-def run_search(mode: str, query: str, limit: int):
-    ddgs = DDGS(timeout=8)
-    if mode == "news":
-        return ddgs.news(query, max_results=limit, safesearch="moderate")
-    return ddgs.text(query, max_results=limit, safesearch="moderate")
+def run_text_search(query: str, limit: int):
+    ddgs = DDGS(timeout=12)
+    errors = []
+    for backend in ("bing", "html", "lite", "auto"):
+        try:
+            rows = ddgs.text(
+                query,
+                region="wt-wt",
+                safesearch="moderate",
+                backend=backend,
+                max_results=limit,
+            )
+            if rows:
+                return rows, backend, None
+        except Exception as exc:
+            errors.append(f"{backend}: {type(exc).__name__}")
+    return [], None, "; ".join(errors)
 
 
 def search_web(query: str, max_results: int = 10):
     collected = {}
     qtokens = tokenize(query)
     min_hits = 1 if len(qtokens) <= 2 else 2
+    debug = []
 
-    for mode, q in build_queries(query):
-        try:
-            rows = run_search(mode, q, max(8, max_results))
-        except Exception:
-            continue
+    for q in build_queries(query):
+        rows, backend, error = run_text_search(q, max(12, max_results))
+        debug.append({"query": q, "backend": backend, "count": len(rows), "error": error})
 
         for r in rows or []:
             url = r.get("href") or r.get("url")
@@ -130,7 +136,7 @@ def search_web(query: str, max_results: int = 10):
         per_host[r["host"]] = per_host.get(r["host"], 0) + 1
         if len(final) >= max_results:
             break
-    return final
+    return final, debug
 
 
 def coverage(results):
@@ -148,7 +154,7 @@ def coverage(results):
 
 
 st.title("🔎 Provera izvora")
-st.caption("Alat prvo odbacuje nerelevantne rezultate, zatim rangira izvore po relevantnosti i tipu izvora.")
+st.caption("Alat odbacuje nerelevantne rezultate i pokušava više search backend-a ako jedan ne radi.")
 
 query = st.text_area(
     "Unesi tvrdnju, temu ili pitanje",
@@ -161,7 +167,7 @@ if st.button("Proveri", type="primary", use_container_width=True):
         st.warning("Unesi pitanje ili tvrdnju.")
     else:
         with st.spinner("Tražim relevantne izvore..."):
-            results = search_web(query.strip(), count)
+            results, debug = search_web(query.strip(), count)
             label, score = coverage(results)
 
         st.subheader("Procena pokrivenosti")
@@ -169,7 +175,9 @@ if st.button("Proveri", type="primary", use_container_width=True):
         st.write(f"**{label}** — {score}/100")
 
         if not results:
-            st.warning("Pretraga nije našla dovoljno relevantnih rezultata. To ne znači da je tvrdnja netačna — samo da pretraga nije našla dovoljno dobrih izvora.")
+            st.warning("Pretraga nije našla dovoljno relevantnih rezultata. To ne znači da je tvrdnja netačna.")
+            with st.expander("Tehnički detalji pretrage"):
+                st.json(debug)
         else:
             for i, r in enumerate(results, 1):
                 with st.expander(f"{i}. {r['title']} — {r['host']}", expanded=i <= 3):
