@@ -2,7 +2,7 @@ import re
 from urllib.parse import urlparse
 
 import streamlit as st
-from ddgs import DDGS
+from duckduckgo_search import DDGS
 
 st.set_page_config(page_title="Provera izvora", page_icon="🔎", layout="wide")
 
@@ -66,8 +66,6 @@ def relevance(query: str, title: str, snippet: str) -> tuple[int, int]:
 
 
 def build_queries(query: str) -> list[tuple[str, str]]:
-    # Ne dodajemo strane ključne reči tipa "Reuters AP BBC" u glavni upit,
-    # jer su prethodno kvarile rezultate za kratke upite na srpskom.
     return [
         ("web", query),
         ("news", query),
@@ -104,11 +102,7 @@ def search_web(query: str, max_results: int = 10):
             kind, authority = source_type(url)
             rel, hits = relevance(query, title, snippet)
 
-            # Ključna zaštita od rezultata kao Amazon/HP/Rule34: rezultat mora
-            # stvarno da sadrži reči iz korisnikovog pitanja.
-            if hits < min_hits:
-                continue
-            if authority < 0:
+            if hits < min_hits or authority < 0:
                 continue
 
             rank = rel + authority
